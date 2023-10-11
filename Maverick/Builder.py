@@ -7,278 +7,161 @@
 4. write to disk
 """
 
-import os
-import codecs
-import shutil
 import functools
-import math
-import json
+import os
+import pathlib
+import shutil
+import sys
 
-from .Utils import logged_func, print_color, Color, safe_write, \
-    safe_read, unify_joinpath, copytree, gen_hash
-from .Metadata import Metadata
-from .Content import Content, ContentList, group_by_category, group_by_tagname
-from .Router import Router
-from .Renderer import Renderer
-from .Cache import dump_log
+from .Config import Config
+from .Content import Content, ContentList
+from .Utils import (logged_func, print_color, Color, unify_joinpath,
+                    force_rmtree, run)
+
+
+class TemplateError(BaseException):
+  pass
 
 
 class Builder:
-    def __init__(self, conf):
-        self._config = conf
-        self._renderer = Renderer(conf)
-        self._router = Router(conf)
-        self._posts = ContentList()
-        self._pages = ContentList()
-        self._tags = set()
-        self._categories = set()
-        self._search_cache_hash = ''
 
-    @logged_func('')
-    def clean(self):
-        if os.path.exists(self._config.build_dir):
-            try:
-                shutil.rmtree(self._config.build_dir)
-            except BaseException as e:
-                print(e)
+  def __init__(self, conf: Config):
+    self._config = conf
+    self._posts = ContentList()
+    self._pages = ContentList()
 
-    @logged_func('')
-    def build_index(self):
-        # paging by config.index_page_size
-        page_size = self._config.index_page_size
-        total_contents = len(self._posts)
-        total_pages = math.ceil(total_contents / page_size)
+  @logged_func('')
+  def clean(self):
+    if os.path.exists(self._config.build_dir):
+      try:
+        shutil.rmtree(self._config.build_dir)
+      except BaseException as e:
+        print(e)
 
-        for page in range(0, total_pages):
-            current_list = self._posts[page * page_size:min((page+1)*page_size,
-                                                            total_contents)]
+  @staticmethod
+  def clone_remote_theme(save_dir: str, config: dict):
+    """Clone a remote repo to local disk.
+    """
+    os.makedirs(save_dir, exist_ok=True)
 
-            _, local_path = self._router.gen("index", "", page+1)
-            if not os.path.exists(local_path):
-                os.makedirs(local_path)
-            local_path += "index.html"
+    repo_dir = os.path.join(save_dir, config['name'])
 
-            safe_write(local_path, self._renderer.render_index(
-                current_list, page+1, total_pages))
+    if os.path.exists(repo_dir):
+      force_rmtree(repo_dir)
 
-    @logged_func('')
-    def build_archives(self):
-        # paging by config.archives_page_size
-        page_size = self._config.archives_page_size
-        total_contents = len(self._posts)
-        total_pages = math.ceil(total_contents / page_size)
+    repo_url = config['url']
+    repo_branch = config.get('branch', 'master')
+    repo_tag = config.get('tag', '')
 
-        for page in range(0, total_pages):
-            current_list = \
-                self._posts[page *
-                            page_size:min((page+1)*page_size, total_contents)]
+    def safe_run(command, cwd):
+      try:
+        run(command, cwd)
+      except Exception:
+        raise TemplateError('Cannot fetch theme from ' + repo_url)
 
-            _, local_path = self._router.gen("archives", "", page+1)
-            if not os.path.exists(local_path):
-                os.makedirs(local_path)
-            local_path += "index.html"
+    safe_run('git clone -b %s %s %s' % (repo_branch, repo_url, repo_dir), '.')
+    if repo_tag != '':
+      safe_run('git checkout %s' & repo_tag, repo_dir)
 
-            safe_write(local_path, self._renderer.render_archives(
-                current_list, page+1, total_pages))
+  @logged_func()
+  def setup_theme(self):
+    """Setup theme in this method.
 
-    @logged_func('')
-    def build_tags(self):
-        for tag in self._tags:
-            posts = self._posts.re_group(group_by_tagname(tag))
+    1. handle sys.path for local theme
+    2. clone from remote for git theme
+    3. install deps for theme
+    """
+    template_conf = self._config.template
+    if isinstance(template_conf, str):
+      # Either a local path or the name of built-in themes
+      if os.path.exists(template_conf):
+        template_conf = {
+            'name': os.path.split(template_conf)[-1],
+            'type': 'local',
+            'path': template_conf
+        }
+      elif template_conf in ['Kepler', 'Galileo']:
+        template_conf = {
+            'name': template_conf,
+            'type': 'git',
+            'url': 'https://github.com/AlanDecode/Maverick-Theme-{}.git'.format(
+                template_conf),
+            'branch': 'latest'
+        }
+      else:
+        raise TemplateError('Can not found local theme {}'.format(
+            self._config.template))
 
-            page_size = self._config.archives_page_size
-            total_pages = math.ceil(len(posts) / page_size)
+    # If its remote theme, clone it to disk first
+    if template_conf['type'] == 'git':
+      template_path = unify_joinpath(self._config._template_dir,
+                                     template_conf['name'])
+      if not os.path.exists(template_path):
+        self.clone_remote_theme(self._config._template_dir, template_conf)
+      template_conf['type'] = 'local'
+      template_conf['path'] = template_path
 
-            for page in range(0, total_pages):
-                current_list = \
-                    posts[page * page_size:min(
-                        (page+1)*page_size, len(posts))]
+    sys.path.insert(0, os.path.split(template_conf['path'])[0])
 
-                _, local_path = self._router.gen("tag", tag, page+1)
-                if not os.path.exists(local_path):
-                    os.makedirs(local_path)
-                local_path += "index.html"
+    # handle deps for theme
+    template_dep_file = unify_joinpath(template_conf['path'],
+                                       'requirements.txt')
+    if os.path.exists(template_dep_file) and os.path.isfile(template_dep_file):
+      try:
+        run('pip install -r %s' % template_dep_file, '.')
+      except Exception:
+        raise TemplateError('Can not install dependencies for theme.')
 
-                safe_write(local_path, self._renderer.render_tags(
-                    current_list, page+1, total_pages, tag))
+    from importlib import import_module
+    self._template = import_module(template_conf['name'])
 
-    @logged_func('')
-    def build_categories(self):
-        for category in self._categories:
-            posts = self._posts.re_group(group_by_category(category))
-
-            page_size = self._config.archives_page_size
-            total_pages = math.ceil(len(posts) / page_size)
-
-            for page in range(0, total_pages):
-                current_list = \
-                    posts[page * page_size:min(
-                        (page+1)*page_size, len(posts))]
-
-                _, local_path = self._router.gen("category", category, page+1)
-                if not os.path.exists(local_path):
-                    os.makedirs(local_path)
-                local_path += "index.html"
-
-                safe_write(local_path, self._renderer.render_categories(
-                    current_list, page+1, total_pages, category))
-
-    @logged_func('')
-    def build_misc(self):
-        """handle static files and cache
-        """
-        self._renderer.render_sitemap(self._pages, self._posts)
-        self._renderer.render_rss(self._posts)
-
-        # copy files under source_dir/static to build_dir
-        static_dir = unify_joinpath(self._config.source_dir, 'static')
-        if os.path.isdir(static_dir):
-            copytree(static_dir, self._config.build_dir)
-
-        # copy static files according to theme config
-        tp = self._renderer._theme
-
-        for src, dist in tp.static_files.items():
-            source_dir = unify_joinpath(
-                os.path.dirname(tp.__file__), src)
-            dist_dir = unify_joinpath(self._config.build_dir, dist)
-
-            if not os.path.exists(source_dir):
-                continue
-
-            if not os.path.exists(dist_dir):
-                os.mkdir(dist_dir)
-            copytree(source_dir, dist_dir)
-
-        # copy images to build_dir/archives/assets
-        dist_dir = unify_joinpath(
-            self._config.build_dir, 'archives/assets')
-        src_dir = './cached_imgs'
-        if not os.path.exists(dist_dir):
-            os.makedirs(dist_dir)
-
-        cached_imgs = set(json.loads(
-            safe_read('./tmp/used_imgs.json') or '[]'))
-        for img in cached_imgs:
-            shutil.copy(unify_joinpath(src_dir, img), dist_dir)
-
-        if os.path.exists('./tmp'):
-            shutil.rmtree('./tmp')
-
-    @logged_func()
-    def build_posts(self):
-        total_posts = len(self._posts)
-        for index in range(total_posts):
-            content = self._posts[index]
-
-            # find visible prev and next
-            index_next = index
-            content_next = None
-            while content_next is None and index_next > 0:
-                index_next -= 1
-                if not self._posts[index_next].skip:
-                    content_next = self._posts[index_next]
-
-            index_prev = index
-            content_prev = None
-            while content_prev is None and index_prev < total_posts-1:
-                index_prev += 1
-                if not self._posts[index_prev].skip:
-                    content_prev = self._posts[index_prev]
-
-            meta = content.meta
-            self._tags = set(meta["tags"]) | self._tags
-            self._categories = set(meta["categories"]) | self._categories
-
-            _, local_path = self._router.gen_by_meta(meta)
-            if not os.path.exists(local_path):
-                os.makedirs(local_path)
-            local_path += "index.html"
-
-            safe_write(local_path, self._renderer.render_post(
-                content, content_prev, content_next))
-            print('Finished: ' + content.get_meta('title'))
-
-    @logged_func()
-    def build_pages(self):
-        total_pages = len(self._pages)
-        for index in range(total_pages):
-            content = self._pages[index]
-            content_next = self._pages[index-1] if index > 0 else None
-            content_prev = self._posts[index +
-                                       1] if index < total_pages-1 else None
-
-            _, local_path = self._router.gen_by_content(content)
-            if not os.path.exists(local_path):
-                os.makedirs(local_path)
-            local_path += "index.html"
-
-            safe_write(local_path, self._renderer.render_page(
-                content, content_prev, content_next))
-            print('Finished: ' + content.get_meta('title'))
-
-    @logged_func()
-    def build_search_cache(self):
-        """build search cache json
-        """
-        cache_str = self._renderer.render_search_cache(
-            self._posts, self._pages)
-        search_cache_hash = gen_hash(cache_str)
-        self._renderer.update_env({"search_cache_hash": search_cache_hash})
-        safe_write(unify_joinpath(
-            self._config.build_dir, search_cache_hash + '.json'), cache_str)
-
-    def build_all(self):
-        """Init building
+  def build_all(self):
+    """Init building
         """
 
-        # delete last build
-        self.clean()
+    # delete last build
+    self.clean()
 
-        print('Loading contents...')
-        walker = os.walk(self._config.source_dir)
-        for path, _, filelist in walker:
-            for file in filelist:
-                if file.split(".")[-1].lower() == "md" or \
-                        file.split(".")[-1].lower() == "markdown":
+    print('Loading contents...')
+    walker = os.walk(self._config.source_dir)
+    source_abs_dir = pathlib.PurePath(os.path.abspath(self._config.source_dir))
+    for path, _, filelist in walker:
+      for file in filelist:
+        if file.split(".")[-1].lower() == "md" or \
+                file.split(".")[-1].lower() == "markdown":
 
-                        content = Content(os.path.abspath(
-                            unify_joinpath(path, file)))
-                        if not content.get_meta("status").lower() in [
-                                "publish", "published", "hide", "hidden"]:
-                            continue
+          content_path = os.path.abspath(unify_joinpath(path, file))
+          content = Content(content_path)
+          if not content.get_meta("status").lower() in [
+              "publish", "published", "hide", "hidden"
+          ]:
+            continue
 
-                        layout = content.get_meta("layout").lower()
-                        if layout == "post":
-                            self._posts.append(content)
-                        elif layout == "page":
-                            self._pages.append(content)
-        print('Contents loaded.')
+          layout = content.get_meta("layout").lower()
+          if layout == "post":
+            if (self._config.category_by_folder):
+              relative_path = pathlib.PurePath(content_path).relative_to(
+                  source_abs_dir)
+              relative_path = list(relative_path.parts[0:-1])
+              if len(relative_path) == 0:
+                relative_path.append('Default')
+              content.update_meta('categories', relative_path)
+            self._posts.append(content)
+          elif layout == "page":
+            content.update_meta('categories', [])
+            self._pages.append(content)
+    print('Contents loaded.')
 
-        self._posts = ContentList(sorted(self._posts,
-                                         key=functools.cmp_to_key(
-                                             Content.cmp_by_date),
-                                         reverse=True))
-        self._pages = ContentList(sorted(self._pages,
-                                         key=functools.cmp_to_key(
-                                             Content.cmp_by_date),
-                                         reverse=True))
-        self.build_search_cache()
-        self.build_posts()
-        self.build_pages()
+    self._posts = ContentList(
+        sorted(self._posts,
+               key=functools.cmp_to_key(Content.cmp_by_date),
+               reverse=True))
+    self._pages = ContentList(
+        sorted(self._pages,
+               key=functools.cmp_to_key(Content.cmp_by_date),
+               reverse=True))
 
-        dump_log()
+    self.setup_theme()
+    self._template.render(self._config, self._posts, self._pages)
 
-        # filter out hidden posts before building post list
-        self._posts = ContentList(
-            filter(lambda content: not content.skip, self._posts))
-        self._pages = ContentList(
-            filter(lambda content: not content.skip, self._pages))
-
-        self.build_index()
-        self.build_archives()
-        self.build_tags()
-        self.build_categories()
-        self.build_misc()
-
-        print_color('\nAll done, enjoy.', Color.GREEN.value)
+    print_color('\nAll done, enjoy.', Color.GREEN.value)

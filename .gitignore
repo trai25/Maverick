@@ -2,6 +2,8 @@ cached_imgs
 tmp
 temp
 test_dist
+devconf.py
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -237,6 +239,3 @@ dist
 
 # TernJS port file
 .tern-port
-
-# vscode
-.vscode/
